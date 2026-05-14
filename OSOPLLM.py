@@ -80,6 +80,14 @@ def flatten_activations(inp: torch.Tensor) -> torch.Tensor:
     return inp.reshape(-1, inp.shape[-1])
 
 
+def cat_optional_tensors(tensors):
+    if all(tensor is None for tensor in tensors):
+        return None
+    if any(tensor is None for tensor in tensors):
+        raise RuntimeError("Mixed None and Tensor values were captured for a replay argument.")
+    return torch.cat(tensors, dim=0)
+
+
 def load_gamma_source(path: Optional[str]):
     if path is None:
         return None
@@ -312,9 +320,11 @@ def collect_first_layer_inputs(model_name: str, model, calib_loader, dev):
 
         def forward(self, inp, **kwargs):
             inps.append(inp.detach().cpu())
-            attention_masks.append(kwargs["attention_mask"].detach().cpu())
+            attention_mask = kwargs.get("attention_mask")
+            attention_masks.append(None if attention_mask is None else attention_mask.detach().cpu())
             if "opt" not in model_name:
-                position_ids.append(kwargs["position_ids"].detach().cpu())
+                pos = kwargs.get("position_ids")
+                position_ids.append(None if pos is None else pos.detach().cpu())
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -330,11 +340,11 @@ def collect_first_layer_inputs(model_name: str, model, calib_loader, dev):
     torch.cuda.empty_cache()
 
     inps = torch.cat(inps, dim=0)
-    attention_masks = torch.cat(attention_masks, dim=0)
+    attention_masks = cat_optional_tensors(attention_masks)
     if "opt" in model_name:
         position_ids = None
     else:
-        position_ids = torch.cat(position_ids, dim=0)
+        position_ids = cat_optional_tensors(position_ids)
     return inps, attention_masks, position_ids
 
 
@@ -395,11 +405,11 @@ def osop_compress(
         outs = []
         for sample_idx in range(inps.shape[0]):
             inp = inps[sample_idx:sample_idx + 1].to(dev)
-            attn = attention_masks[sample_idx:sample_idx + 1].to(dev)
+            attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
             if "opt" in model_name:
                 out = layer(inp, attention_mask=attn)[0]
             else:
-                pos = position_ids[sample_idx:sample_idx + 1].to(dev)
+                pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
                 out = layer(inp, attention_mask=attn, position_ids=pos)[0]
             outs.append(out.detach().cpu())
 
