@@ -26,6 +26,14 @@ def get_transformer_layers(model_name: str, model):
     return model.model.layers
 
 
+def patch_svd_layer_indices(model_name: str, model):
+    if "llama" not in model_name and "vicuna" not in model_name:
+        return
+    for layer_idx, layer in enumerate(get_transformer_layers(model_name, model)):
+        if hasattr(layer, "self_attn") and isinstance(layer.self_attn, SVD_LlamaAttention):
+            layer.self_attn.layer_idx = layer_idx
+
+
 def move_embeddings(model_name: str, model, device):
     if "opt" in model_name:
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(device)
@@ -57,6 +65,10 @@ def target_rank(weight: torch.Tensor, keep_ratio: float) -> int:
 
 
 def component_rank(model_name: str, model, name: str, weight: torch.Tensor, keep_ratio: float) -> int:
+    if ("llama" in model_name or "vicuna" in model_name) and any(
+        proj in name for proj in ("q_proj", "k_proj", "v_proj", "o_proj")
+    ):
+        return max(1, int(model.config.hidden_size * keep_ratio / 2))
     if "mistral" in model_name and any(proj in name for proj in ("q_proj", "k_proj", "v_proj", "o_proj")):
         return max(1, int(model.config.hidden_size * keep_ratio / 2))
     return target_rank(weight, keep_ratio)
@@ -225,18 +237,17 @@ def choose_method(weight: torch.Tensor, mode: str) -> str:
     raise ValueError(f"Unknown compression mode: {mode}")
 
 
-def build_svd_modules(model_name: str, model, layer, keep_ratio: float):
+def build_svd_modules(model_name: str, model, layer, keep_ratio: float, layer_idx: int = 0):
     if "llama" in model_name or "vicuna" in model_name:
-        return (
-            SVD_LlamaAttention(config=model.config, ratio=keep_ratio),
-            SVD_LlamaMLP(
-                hidden_size=layer.hidden_size,
-                intermediate_size=model.config.intermediate_size,
-                hidden_act=model.config.hidden_act,
-                ratio=keep_ratio,
-            ),
-            None,
+        svd_attn = SVD_LlamaAttention(config=model.config, ratio=keep_ratio)
+        svd_attn.layer_idx = layer_idx
+        svd_mlp = SVD_LlamaMLP(
+            hidden_size=layer.hidden_size,
+            intermediate_size=model.config.intermediate_size,
+            hidden_act=model.config.hidden_act,
+            ratio=keep_ratio,
         )
+        return svd_attn, svd_mlp, None
     if "mistral" in model_name:
         return (
             SVD_MistralAttention(config=model.config, ratio=keep_ratio),
@@ -416,7 +427,7 @@ def osop_compress(
         for handle in handles:
             handle.remove()
 
-        svd_attn, svd_mlp, svd_decoder = build_svd_modules(model_name, model, layer, keep_ratio)
+        svd_attn, svd_mlp, svd_decoder = build_svd_modules(model_name, model, layer, keep_ratio, layer_idx)
         for name, accumulator in accumulators.items():
             a, b = accumulator.factors()
             assign_factor(model_name, layer, svd_attn, svd_mlp, svd_decoder, name, a, b, dtype)
@@ -495,6 +506,7 @@ if __name__ == "__main__":
             damping=args.damping,
             accum_dtype=parse_accum_dtype(args.accum_dtype),
         )
+        patch_svd_layer_indices(args.model, model)
         if args.save_path is not None:
             os.makedirs(args.save_path, exist_ok=True)
             save_name = (
@@ -508,6 +520,7 @@ if __name__ == "__main__":
             model, tokenizer = get_model_from_huggingface(args.model)
         else:
             model, tokenizer = get_model_from_local(args.model_path)
+        patch_svd_layer_indices(args.model, model)
         model.eval()
         model = model.float().to(args.DEV)
         if args.step == 4:
