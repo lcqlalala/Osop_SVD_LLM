@@ -34,6 +34,8 @@ def move_embeddings(model_name: str, model, device):
     else:
         model.model.embed_tokens = model.model.embed_tokens.to(device)
         model.model.norm = model.model.norm.to(device)
+        if hasattr(model.model, "rotary_emb"):
+            model.model.rotary_emb = model.model.rotary_emb.to(device)
 
 
 def move_embeddings_cpu(model_name: str, model):
@@ -44,6 +46,8 @@ def move_embeddings_cpu(model_name: str, model):
     else:
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
+        if hasattr(model.model, "rotary_emb"):
+            model.model.rotary_emb = model.model.rotary_emb.cpu()
 
 
 def target_rank(weight: torch.Tensor, keep_ratio: float) -> int:
