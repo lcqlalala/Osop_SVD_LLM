@@ -73,11 +73,25 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    if position_ids is None:
+        cos = cos[:, :, : q.shape[-2], :]
+        sin = sin[:, :, : q.shape[-2], :]
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
     gather_indices = position_ids[:, None, :, None]  # [bs, 1, seq_len, 1]
     gather_indices = gather_indices.repeat(1, cos.shape[1], 1, cos.shape[3])
     cos = torch.gather(cos.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
     sin = torch.gather(sin.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
     
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def apply_rotary_pos_emb_v44(q, k, cos, sin):
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -153,7 +167,11 @@ class SVD_LlamaAttention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        del cache_position, kwargs
         bsz, q_len, _ = hidden_states.size()
     
         query_states = self.q_u_proj(self.q_v_proj(hidden_states)).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -165,9 +183,12 @@ class SVD_LlamaAttention(nn.Module):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
- 
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        else:
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb_v44(query_states, key_states, cos, sin)
         # [bsz, nh, t, hd]
 
         if past_key_value is not None:
