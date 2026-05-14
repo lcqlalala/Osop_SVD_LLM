@@ -281,6 +281,8 @@ class SVD_LlamaAttention(nn.Module):
 
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            if causal_mask.size(0) == 1 and bsz != 1:
+                causal_mask = causal_mask.expand(bsz, -1, -1, -1)
             if causal_mask.size() != (bsz, 1, q_len, key_states.shape[-2]):
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, q_len, key_states.shape[-2])}, but is {causal_mask.size()}"
