@@ -226,14 +226,14 @@ class OSOPAccumulator:
         return pad_factors(a, b, self.rank)
 
 
-def choose_method(weight: torch.Tensor, mode: str) -> str:
+def choose_method(weight: torch.Tensor, mode: str, osop_dim_threshold: float = 1.0) -> str:
     rows, columns = weight.shape
     if mode == "osop":
         return "osop"
     if mode == "whitening":
         return "whitening"
     if mode == "hybrid":
-        return "osop" if rows <= columns else "whitening"
+        return "osop" if rows <= columns * osop_dim_threshold else "whitening"
     raise ValueError(f"Unknown compression mode: {mode}")
 
 
@@ -371,6 +371,7 @@ def osop_compress(
     gamma_source=None,
     damping: float = 1e-6,
     accum_dtype: torch.dtype = torch.float32,
+    osop_dim_threshold: float = 1.0,
 ):
     print("Collecting calibration activations for OSOP...")
     use_cache = model.config.use_cache
@@ -387,7 +388,7 @@ def osop_compress(
         method_counts = {"osop": 0, "whitening": 0}
 
         for name, module in subset.items():
-            method = choose_method(module.weight, mode)
+            method = choose_method(module.weight, mode, osop_dim_threshold=osop_dim_threshold)
             method_counts[method] += 1
             rank = component_rank(model_name, model, name, module.weight, keep_ratio)
             external_gamma = lookup_external_gamma(gamma_source, layer_idx, name)
@@ -472,6 +473,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--DEV", type=str, default="cuda")
     parser.add_argument("--mode", type=str, default="hybrid", choices=["osop", "whitening", "hybrid"])
+    parser.add_argument(
+        "--osop_dim_threshold",
+        type=float,
+        default=1.0,
+        help="In hybrid mode, use OSOP only when d_out <= threshold * d_in. Try 0.75 to keep OSOP mainly for down_proj.",
+    )
     parser.add_argument("--gamma_mode", type=str, default="ones", choices=["ones", "row_norm", "row_abs_mean"])
     parser.add_argument("--gamma_path", type=str, default=None, help="Optional torch file: {layer_idx: {linear_name: gamma_diag}}.")
     parser.add_argument("--damping", type=float, default=1e-6)
@@ -505,6 +512,7 @@ if __name__ == "__main__":
             gamma_source=gamma_source,
             damping=args.damping,
             accum_dtype=parse_accum_dtype(args.accum_dtype),
+            osop_dim_threshold=args.osop_dim_threshold,
         )
         patch_svd_layer_indices(args.model, model)
         if args.save_path is not None:
