@@ -418,6 +418,7 @@ def osop_compress(
     osop_dim_threshold: float = 1.0,
     propagate_compressed_outputs: bool = False,
     local_update: bool = False,
+    teacher_update: bool = False,
     local_update_damping: float = 1e-4,
 ):
     print("Collecting calibration activations for OSOP...")
@@ -425,6 +426,7 @@ def osop_compress(
     model.config.use_cache = False
     layers = get_transformer_layers(model_name, model)
     inps, attention_masks, position_ids = collect_first_layer_inputs(model_name, model, calib_loader, dev)
+    teacher_inps = inps if teacher_update else None
     dtype = next(iter(model.parameters())).dtype
 
     print("Start OSOP compression...")
@@ -481,7 +483,7 @@ def osop_compress(
             a, b = accumulator.factors()
             factors[name] = [a, b]
 
-        if local_update:
+        if local_update or teacher_update:
             refitters: Dict[str, LowRankRefitAccumulator] = {}
             for name, module in subset.items():
                 refitters[name] = LowRankRefitAccumulator(
@@ -491,21 +493,55 @@ def osop_compress(
                     accum_dtype=accum_dtype,
                 )
 
-            refit_handles = []
-            for name, module in subset.items():
-                def add_refit_batch(module_, inp, out, layer_name=name):
-                    del module_
-                    refitters[layer_name].add_batch(inp[0], out)
-                refit_handles.append(module.register_forward_hook(add_refit_batch))
+            if teacher_update:
+                teacher_outputs = {}
+                phase = {"name": "teacher"}
+                teacher_outs = []
 
-            for sample_idx in range(inps.shape[0]):
-                inp = inps[sample_idx:sample_idx + 1].to(dev)
-                attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
-                pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
-                run_decoder_layer(model_name, layer, inp, attn, pos)
+                refit_handles = []
+                for name, module in subset.items():
+                    def add_teacher_refit_batch(module_, inp, out, layer_name=name):
+                        del module_
+                        if phase["name"] == "teacher":
+                            teacher_outputs[layer_name] = out.detach()
+                        else:
+                            refitters[layer_name].add_batch(inp[0], teacher_outputs[layer_name])
+                    refit_handles.append(module.register_forward_hook(add_teacher_refit_batch))
 
-            for handle in refit_handles:
-                handle.remove()
+                for sample_idx in range(inps.shape[0]):
+                    attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
+                    pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
+
+                    teacher_outputs.clear()
+                    phase["name"] = "teacher"
+                    teacher_inp = teacher_inps[sample_idx:sample_idx + 1].to(dev)
+                    teacher_out = run_decoder_layer(model_name, layer, teacher_inp, attn, pos)
+                    teacher_outs.append(teacher_out.detach().cpu())
+
+                    phase["name"] = "compressed"
+                    inp = inps[sample_idx:sample_idx + 1].to(dev)
+                    run_decoder_layer(model_name, layer, inp, attn, pos)
+
+                for handle in refit_handles:
+                    handle.remove()
+                teacher_inps = torch.cat(teacher_outs, dim=0)
+                del teacher_outs, teacher_outputs
+            else:
+                refit_handles = []
+                for name, module in subset.items():
+                    def add_refit_batch(module_, inp, out, layer_name=name):
+                        del module_
+                        refitters[layer_name].add_batch(inp[0], out)
+                    refit_handles.append(module.register_forward_hook(add_refit_batch))
+
+                for sample_idx in range(inps.shape[0]):
+                    inp = inps[sample_idx:sample_idx + 1].to(dev)
+                    attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
+                    pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
+                    run_decoder_layer(model_name, layer, inp, attn, pos)
+
+                for handle in refit_handles:
+                    handle.remove()
 
             for name, refitter in refitters.items():
                 factors[name][0] = refitter.solve_a()
@@ -520,7 +556,7 @@ def osop_compress(
         else:
             layers[layer_idx] = layer.cpu()
 
-        if local_update or propagate_compressed_outputs:
+        if local_update or teacher_update or propagate_compressed_outputs:
             compressed_layer = layers[layer_idx].to(dev)
             compressed_outs = []
             for sample_idx in range(inps.shape[0]):
@@ -582,6 +618,11 @@ if __name__ == "__main__":
         help="After each layer is compressed, feed its compressed outputs to calibrate later layers.",
     )
     parser.add_argument("--local_update", action="store_true", help="Refit A with B fixed on calibration activations and propagate compressed layer outputs.")
+    parser.add_argument(
+        "--teacher_update",
+        action="store_true",
+        help="Refit A with compressed-prefix module inputs and teacher-trajectory module outputs.",
+    )
     parser.add_argument("--local_update_damping", type=float, default=1e-4)
     parser.add_argument("--step", type=int, default=1, help="1: OSOP compress, 4: PPL eval, 5: efficiency eval")
     parser.add_argument("--eval_batch_size", type=int, default=4)
@@ -615,6 +656,7 @@ if __name__ == "__main__":
             osop_dim_threshold=args.osop_dim_threshold,
             propagate_compressed_outputs=args.propagate_compressed_outputs,
             local_update=args.local_update,
+            teacher_update=args.teacher_update,
             local_update_damping=args.local_update_damping,
         )
         patch_svd_layer_indices(args.model, model)
