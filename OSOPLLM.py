@@ -144,6 +144,18 @@ def build_gamma_diag(
     return torch.clamp(gamma, min=damping)
 
 
+def parse_target_patterns(patterns: Optional[str]):
+    if patterns is None or patterns.strip() == "" or patterns.strip().lower() == "all":
+        return None
+    return [pattern.strip() for pattern in patterns.split(",") if pattern.strip()]
+
+
+def name_matches_patterns(name: str, patterns) -> bool:
+    if patterns is None:
+        return True
+    return any(pattern in name for pattern in patterns)
+
+
 class OSOPAccumulator:
     """Streams either output-space or input-space Gram matrices for one Linear layer."""
 
@@ -419,6 +431,7 @@ def osop_compress(
     propagate_compressed_outputs: bool = False,
     local_update: bool = False,
     teacher_update: bool = False,
+    teacher_update_targets: Optional[str] = None,
     local_update_damping: float = 1e-4,
 ):
     print("Collecting calibration activations for OSOP...")
@@ -427,6 +440,7 @@ def osop_compress(
     layers = get_transformer_layers(model_name, model)
     inps, attention_masks, position_ids = collect_first_layer_inputs(model_name, model, calib_loader, dev)
     teacher_inps = inps if teacher_update else None
+    teacher_target_patterns = parse_target_patterns(teacher_update_targets)
     dtype = next(iter(model.parameters())).dtype
 
     print("Start OSOP compression...")
@@ -486,6 +500,8 @@ def osop_compress(
         if local_update or teacher_update:
             refitters: Dict[str, LowRankRefitAccumulator] = {}
             for name, module in subset.items():
+                if teacher_update and not name_matches_patterns(name, teacher_target_patterns):
+                    continue
                 refitters[name] = LowRankRefitAccumulator(
                     b=factors[name][1],
                     out_features=module.weight.shape[0],
@@ -500,6 +516,8 @@ def osop_compress(
 
                 refit_handles = []
                 for name, module in subset.items():
+                    if name not in refitters:
+                        continue
                     def add_teacher_refit_batch(module_, inp, out, layer_name=name):
                         del module_
                         if phase["name"] == "teacher":
@@ -529,6 +547,8 @@ def osop_compress(
             else:
                 refit_handles = []
                 for name, module in subset.items():
+                    if name not in refitters:
+                        continue
                     def add_refit_batch(module_, inp, out, layer_name=name):
                         del module_
                         refitters[layer_name].add_batch(inp[0], out)
@@ -623,6 +643,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Refit A with compressed-prefix module inputs and teacher-trajectory module outputs.",
     )
+    parser.add_argument(
+        "--teacher_update_targets",
+        type=str,
+        default="all",
+        help="Comma-separated substrings of Linear names to teacher-update, e.g. 'o_proj,down_proj'. Use 'all' for every Linear.",
+    )
     parser.add_argument("--local_update_damping", type=float, default=1e-4)
     parser.add_argument("--step", type=int, default=1, help="1: OSOP compress, 4: PPL eval, 5: efficiency eval")
     parser.add_argument("--eval_batch_size", type=int, default=4)
@@ -657,6 +683,7 @@ if __name__ == "__main__":
             propagate_compressed_outputs=args.propagate_compressed_outputs,
             local_update=args.local_update,
             teacher_update=args.teacher_update,
+            teacher_update_targets=args.teacher_update_targets,
             local_update_damping=args.local_update_damping,
         )
         patch_svd_layer_indices(args.model, model)
