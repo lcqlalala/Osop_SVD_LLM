@@ -226,6 +226,43 @@ class OSOPAccumulator:
         return pad_factors(a, b, self.rank)
 
 
+class LowRankRefitAccumulator:
+    """Least-squares refit of A with B fixed: min_A ||Y - (X B^T) A^T||_F^2."""
+
+    def __init__(self, b: torch.Tensor, out_features: int, damping: float, accum_dtype: torch.dtype = torch.float32):
+        self.b = b.detach().float()
+        self.rank = b.shape[0]
+        self.out_features = out_features
+        self.damping = damping
+        self.accum_dtype = accum_dtype
+        self.hth = torch.zeros((self.rank, self.rank), dtype=accum_dtype, device="cpu")
+        self.hty = torch.zeros((self.rank, out_features), dtype=accum_dtype, device="cpu")
+        self.nsamples = 0
+
+    @torch.no_grad()
+    def add_batch(self, inp: torch.Tensor, out: torch.Tensor):
+        x = flatten_activations(inp.detach()).float()
+        y = flatten_activations(out.detach()).float()
+        b = self.b.to(x.device, dtype=x.dtype)
+        h = x.matmul(b.t())
+        self.hth += h.t().matmul(h).to("cpu", dtype=self.accum_dtype)
+        self.hty += h.t().matmul(y).to("cpu", dtype=self.accum_dtype)
+        self.nsamples += x.shape[0]
+
+    @torch.no_grad()
+    def solve_a(self) -> torch.Tensor:
+        if self.nsamples == 0:
+            raise RuntimeError("No calibration samples were accumulated for local refit.")
+        hth = self.hth.float()
+        hty = self.hty.float()
+        eye = torch.eye(self.rank, dtype=hth.dtype)
+        try:
+            a_t = torch.linalg.solve(hth + self.damping * eye, hty)
+        except RuntimeError:
+            a_t = torch.linalg.lstsq(hth + self.damping * eye, hty).solution
+        return a_t.t().contiguous()
+
+
 def choose_method(weight: torch.Tensor, mode: str, osop_dim_threshold: float = 1.0) -> str:
     rows, columns = weight.shape
     if mode == "osop":
@@ -315,6 +352,13 @@ def assign_factor(model_name: str, layer, svd_attn, svd_mlp, svd_decoder, name: 
 
 
 @torch.no_grad()
+def run_decoder_layer(model_name: str, layer, inp, attention_mask, position_ids):
+    if "opt" in model_name:
+        return layer(inp, attention_mask=attention_mask)[0]
+    return layer(inp, attention_mask=attention_mask, position_ids=position_ids)[0]
+
+
+@torch.no_grad()
 def collect_first_layer_inputs(model_name: str, model, calib_loader, dev):
     layers = get_transformer_layers(model_name, model)
     move_embeddings(model_name, model, dev)
@@ -372,6 +416,9 @@ def osop_compress(
     damping: float = 1e-6,
     accum_dtype: torch.dtype = torch.float32,
     osop_dim_threshold: float = 1.0,
+    propagate_compressed_outputs: bool = False,
+    local_update: bool = False,
+    local_update_damping: float = 1e-4,
 ):
     print("Collecting calibration activations for OSOP...")
     use_cache = model.config.use_cache
@@ -429,8 +476,41 @@ def osop_compress(
             handle.remove()
 
         svd_attn, svd_mlp, svd_decoder = build_svd_modules(model_name, model, layer, keep_ratio, layer_idx)
+        factors = {}
         for name, accumulator in accumulators.items():
             a, b = accumulator.factors()
+            factors[name] = [a, b]
+
+        if local_update:
+            refitters: Dict[str, LowRankRefitAccumulator] = {}
+            for name, module in subset.items():
+                refitters[name] = LowRankRefitAccumulator(
+                    b=factors[name][1],
+                    out_features=module.weight.shape[0],
+                    damping=local_update_damping,
+                    accum_dtype=accum_dtype,
+                )
+
+            refit_handles = []
+            for name, module in subset.items():
+                def add_refit_batch(module_, inp, out, layer_name=name):
+                    del module_
+                    refitters[layer_name].add_batch(inp[0], out)
+                refit_handles.append(module.register_forward_hook(add_refit_batch))
+
+            for sample_idx in range(inps.shape[0]):
+                inp = inps[sample_idx:sample_idx + 1].to(dev)
+                attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
+                pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
+                run_decoder_layer(model_name, layer, inp, attn, pos)
+
+            for handle in refit_handles:
+                handle.remove()
+
+            for name, refitter in refitters.items():
+                factors[name][0] = refitter.solve_a()
+
+        for name, (a, b) in factors.items():
             assign_factor(model_name, layer, svd_attn, svd_mlp, svd_decoder, name, a, b, dtype)
 
         if "opt" in model_name:
@@ -440,8 +520,21 @@ def osop_compress(
         else:
             layers[layer_idx] = layer.cpu()
 
-        inps = torch.cat(outs, dim=0)
-        del outs, accumulators, layer
+        if local_update or propagate_compressed_outputs:
+            compressed_layer = layers[layer_idx].to(dev)
+            compressed_outs = []
+            for sample_idx in range(inps.shape[0]):
+                inp = inps[sample_idx:sample_idx + 1].to(dev)
+                attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
+                pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
+                compressed_out = run_decoder_layer(model_name, compressed_layer, inp, attn, pos)
+                compressed_outs.append(compressed_out.detach().cpu())
+            layers[layer_idx] = compressed_layer.cpu()
+            inps = torch.cat(compressed_outs, dim=0)
+            del compressed_outs, compressed_layer
+        else:
+            inps = torch.cat(outs, dim=0)
+        del outs, accumulators, layer, factors
         torch.cuda.empty_cache()
 
         print(
@@ -483,6 +576,13 @@ if __name__ == "__main__":
     parser.add_argument("--gamma_path", type=str, default=None, help="Optional torch file: {layer_idx: {linear_name: gamma_diag}}.")
     parser.add_argument("--damping", type=float, default=1e-6)
     parser.add_argument("--accum_dtype", type=str, default="float32", choices=["float32", "float64"])
+    parser.add_argument(
+        "--propagate_compressed_outputs",
+        action="store_true",
+        help="After each layer is compressed, feed its compressed outputs to calibrate later layers.",
+    )
+    parser.add_argument("--local_update", action="store_true", help="Refit A with B fixed on calibration activations and propagate compressed layer outputs.")
+    parser.add_argument("--local_update_damping", type=float, default=1e-4)
     parser.add_argument("--step", type=int, default=1, help="1: OSOP compress, 4: PPL eval, 5: efficiency eval")
     parser.add_argument("--eval_batch_size", type=int, default=4)
     parser.add_argument("--gen_seq_len", type=int, default=1024)
@@ -513,6 +613,9 @@ if __name__ == "__main__":
             damping=args.damping,
             accum_dtype=parse_accum_dtype(args.accum_dtype),
             osop_dim_threshold=args.osop_dim_threshold,
+            propagate_compressed_outputs=args.propagate_compressed_outputs,
+            local_update=args.local_update,
+            local_update_damping=args.local_update_damping,
         )
         patch_svd_layer_indices(args.model, model)
         if args.save_path is not None:
