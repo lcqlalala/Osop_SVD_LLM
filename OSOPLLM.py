@@ -1,5 +1,6 @@
 #coding:utf8
 import argparse
+import copy
 import os
 import sys
 from typing import Dict, Optional, Tuple
@@ -154,6 +155,44 @@ def name_matches_patterns(name: str, patterns) -> bool:
     if patterns is None:
         return True
     return any(pattern in name for pattern in patterns)
+
+
+def compressed_v_name(name: str) -> str:
+    replacements = (
+        ("q_proj", "q_v_proj"),
+        ("k_proj", "k_v_proj"),
+        ("v_proj", "v_v_proj"),
+        ("o_proj", "o_v_proj"),
+        ("out_proj", "out_v_proj"),
+        ("gate_proj", "gate_v_proj"),
+        ("down_proj", "down_v_proj"),
+        ("up_proj", "up_v_proj"),
+        ("fc1", "fc1_v_proj"),
+        ("fc2", "fc2_v_proj"),
+    )
+    for src, dst in replacements:
+        if name.endswith(src):
+            return name[: -len(src)] + dst
+    raise KeyError(f"Cannot map original Linear name to compressed v-proj name: {name}")
+
+
+def compressed_u_name(name: str) -> str:
+    replacements = (
+        ("q_proj", "q_u_proj"),
+        ("k_proj", "k_u_proj"),
+        ("v_proj", "v_u_proj"),
+        ("o_proj", "o_u_proj"),
+        ("out_proj", "out_u_proj"),
+        ("gate_proj", "gate_u_proj"),
+        ("down_proj", "down_u_proj"),
+        ("up_proj", "up_u_proj"),
+        ("fc1", "fc1_u_proj"),
+        ("fc2", "fc2_u_proj"),
+    )
+    for src, dst in replacements:
+        if name.endswith(src):
+            return name[: -len(src)] + dst
+    raise KeyError(f"Cannot map original Linear name to compressed u-proj name: {name}")
 
 
 class OSOPAccumulator:
@@ -497,11 +536,9 @@ def osop_compress(
             a, b = accumulator.factors()
             factors[name] = [a, b]
 
-        if local_update or teacher_update:
+        if local_update:
             refitters: Dict[str, LowRankRefitAccumulator] = {}
             for name, module in subset.items():
-                if teacher_update and not name_matches_patterns(name, teacher_target_patterns):
-                    continue
                 refitters[name] = LowRankRefitAccumulator(
                     b=factors[name][1],
                     out_features=module.weight.shape[0],
@@ -509,62 +546,26 @@ def osop_compress(
                     accum_dtype=accum_dtype,
                 )
 
-            if teacher_update:
-                teacher_outputs = {}
-                phase = {"name": "teacher"}
-                teacher_outs = []
+            refit_handles = []
+            for name, module in subset.items():
+                def add_refit_batch(module_, inp, out, layer_name=name):
+                    del module_
+                    refitters[layer_name].add_batch(inp[0], out)
+                refit_handles.append(module.register_forward_hook(add_refit_batch))
 
-                refit_handles = []
-                for name, module in subset.items():
-                    if name not in refitters:
-                        continue
-                    def add_teacher_refit_batch(module_, inp, out, layer_name=name):
-                        del module_
-                        if phase["name"] == "teacher":
-                            teacher_outputs[layer_name] = out.detach()
-                        else:
-                            refitters[layer_name].add_batch(inp[0], teacher_outputs[layer_name])
-                    refit_handles.append(module.register_forward_hook(add_teacher_refit_batch))
+            for sample_idx in range(inps.shape[0]):
+                inp = inps[sample_idx:sample_idx + 1].to(dev)
+                attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
+                pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
+                run_decoder_layer(model_name, layer, inp, attn, pos)
 
-                for sample_idx in range(inps.shape[0]):
-                    attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
-                    pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
-
-                    teacher_outputs.clear()
-                    phase["name"] = "teacher"
-                    teacher_inp = teacher_inps[sample_idx:sample_idx + 1].to(dev)
-                    teacher_out = run_decoder_layer(model_name, layer, teacher_inp, attn, pos)
-                    teacher_outs.append(teacher_out.detach().cpu())
-
-                    phase["name"] = "compressed"
-                    inp = inps[sample_idx:sample_idx + 1].to(dev)
-                    run_decoder_layer(model_name, layer, inp, attn, pos)
-
-                for handle in refit_handles:
-                    handle.remove()
-                teacher_inps = torch.cat(teacher_outs, dim=0)
-                del teacher_outs, teacher_outputs
-            else:
-                refit_handles = []
-                for name, module in subset.items():
-                    if name not in refitters:
-                        continue
-                    def add_refit_batch(module_, inp, out, layer_name=name):
-                        del module_
-                        refitters[layer_name].add_batch(inp[0], out)
-                    refit_handles.append(module.register_forward_hook(add_refit_batch))
-
-                for sample_idx in range(inps.shape[0]):
-                    inp = inps[sample_idx:sample_idx + 1].to(dev)
-                    attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
-                    pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
-                    run_decoder_layer(model_name, layer, inp, attn, pos)
-
-                for handle in refit_handles:
-                    handle.remove()
+            for handle in refit_handles:
+                handle.remove()
 
             for name, refitter in refitters.items():
                 factors[name][0] = refitter.solve_a()
+
+        teacher_layer = copy.deepcopy(layer).to(dev) if teacher_update else None
 
         for name, (a, b) in factors.items():
             assign_factor(model_name, layer, svd_attn, svd_mlp, svd_decoder, name, a, b, dtype)
@@ -575,6 +576,66 @@ def osop_compress(
             layers[layer_idx] = svd_decoder.cpu()
         else:
             layers[layer_idx] = layer.cpu()
+
+        if teacher_update:
+            compressed_layer = layers[layer_idx].to(dev)
+            teacher_subset = find_layers(teacher_layer)
+            compressed_subset = find_layers(compressed_layer)
+            target_names = [
+                name for name in subset
+                if name_matches_patterns(name, teacher_target_patterns)
+            ]
+            refitters: Dict[str, LowRankRefitAccumulator] = {}
+            for name in target_names:
+                v_name = compressed_v_name(name)
+                refitters[name] = LowRankRefitAccumulator(
+                    b=compressed_subset[v_name].weight.detach().float().cpu(),
+                    out_features=teacher_subset[name].weight.shape[0],
+                    damping=local_update_damping,
+                    accum_dtype=accum_dtype,
+                )
+
+            teacher_outputs = {}
+            teacher_outs = []
+            teacher_handles = []
+            compressed_handles = []
+
+            for name in target_names:
+                def save_teacher_output(module_, inp, out, layer_name=name):
+                    del module_, inp
+                    teacher_outputs[layer_name] = out.detach()
+                teacher_handles.append(teacher_subset[name].register_forward_hook(save_teacher_output))
+
+                v_name = compressed_v_name(name)
+                def add_compressed_input(module_, inp, out, layer_name=name):
+                    del module_, out
+                    refitters[layer_name].add_batch(inp[0], teacher_outputs[layer_name])
+                compressed_handles.append(compressed_subset[v_name].register_forward_hook(add_compressed_input))
+
+            for sample_idx in range(inps.shape[0]):
+                attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
+                pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
+
+                teacher_outputs.clear()
+                teacher_inp = teacher_inps[sample_idx:sample_idx + 1].to(dev)
+                teacher_out = run_decoder_layer(model_name, teacher_layer, teacher_inp, attn, pos)
+                teacher_outs.append(teacher_out.detach().cpu())
+
+                inp = inps[sample_idx:sample_idx + 1].to(dev)
+                run_decoder_layer(model_name, compressed_layer, inp, attn, pos)
+
+            for handle in teacher_handles + compressed_handles:
+                handle.remove()
+
+            compressed_subset = find_layers(compressed_layer)
+            for name, refitter in refitters.items():
+                u_name = compressed_u_name(name)
+                compressed_subset[u_name].weight.data = refitter.solve_a().to(dtype)
+
+            teacher_inps = torch.cat(teacher_outs, dim=0)
+            layers[layer_idx] = compressed_layer.cpu()
+            teacher_layer = teacher_layer.cpu()
+            del teacher_outputs, teacher_outs, teacher_layer, compressed_layer, refitters
 
         if local_update or teacher_update or propagate_compressed_outputs:
             compressed_layer = layers[layer_idx].to(dev)
