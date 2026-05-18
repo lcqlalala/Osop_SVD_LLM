@@ -420,7 +420,7 @@ def module_param_cost(weight: torch.Tensor) -> int:
     return int(weight.shape[0] + weight.shape[1])
 
 
-def allocate_energy_guided_ranks(stats, min_rank: int = 1):
+def allocate_energy_guided_ranks(stats, min_rank_frac: float = 0.7, max_rank_multiplier: float = 1.3):
     total_budget = 0
     plan = {}
     heap = []
@@ -431,10 +431,11 @@ def allocate_energy_guided_ranks(stats, min_rank: int = 1):
         key = stat["key"]
         cost = stat["cost"]
         base_rank = stat["base_rank"]
-        max_rank = stat["max_rank"]
+        min_rank = max(1, int(round(base_rank * min_rank_frac)))
+        max_rank = min(stat["max_rank"], max(min_rank, int(round(base_rank * max_rank_multiplier))))
         eigvals = stat["eigvals"]
         total_budget += base_rank * cost
-        rank = min(max(min_rank, 1), max_rank)
+        rank = min(min_rank, max_rank)
         plan[key] = rank
         used_budget += rank * cost
         if rank < max_rank and rank < eigvals.numel():
@@ -447,15 +448,22 @@ def allocate_energy_guided_ranks(stats, min_rank: int = 1):
             continue
         stat = stats_by_key[key]
         rank = plan[key]
-        if rank >= stat["max_rank"]:
+        max_rank = min(stat["max_rank"], max(1, int(round(stat["base_rank"] * max_rank_multiplier))))
+        if rank >= max_rank:
             continue
         used_budget += cost
         rank += 1
         plan[key] = rank
-        if rank < stat["max_rank"] and rank < stat["eigvals"].numel():
+        if rank < max_rank and rank < stat["eigvals"].numel():
             next_gain = float(stat["eigvals"][rank].item())
             heapq.heappush(heap, (-(next_gain / cost), key, next_gain, cost))
 
+    ranks = list(plan.values())
+    print(
+        "Rank reallocation summary: "
+        f"min={min(ranks)}, max={max(ranks)}, avg={sum(ranks) / len(ranks):.1f}, "
+        f"min_frac={min_rank_frac}, max_multiplier={max_rank_multiplier}"
+    )
     return plan, total_budget, used_budget
 
 
@@ -473,6 +481,8 @@ def collect_osop_rank_stats(
     gamma_source,
     damping: float,
     accum_dtype: torch.dtype,
+    rank_realloc_min_frac: float,
+    rank_realloc_max_multiplier: float,
 ):
     print("Collecting OSOP spectra for energy-guided rank reallocation...")
     stats = []
@@ -536,7 +546,11 @@ def collect_osop_rank_stats(
         del outs, accumulators, layer
         torch.cuda.empty_cache()
 
-    plan, total_budget, used_budget = allocate_energy_guided_ranks(stats)
+    plan, total_budget, used_budget = allocate_energy_guided_ranks(
+        stats,
+        min_rank_frac=rank_realloc_min_frac,
+        max_rank_multiplier=rank_realloc_max_multiplier,
+    )
     print(f"Rank reallocation budget: base={total_budget}, allocated={used_budget}")
     return plan
 
@@ -607,6 +621,8 @@ def osop_compress(
     accum_dtype: torch.dtype = torch.float32,
     osop_dim_threshold: float = 1.0,
     rank_realloc: bool = False,
+    rank_realloc_min_frac: float = 0.7,
+    rank_realloc_max_multiplier: float = 1.3,
     propagate_compressed_outputs: bool = False,
     local_update: bool = False,
     teacher_update: bool = False,
@@ -640,6 +656,8 @@ def osop_compress(
             gamma_source=gamma_source,
             damping=damping,
             accum_dtype=accum_dtype,
+            rank_realloc_min_frac=rank_realloc_min_frac,
+            rank_realloc_max_multiplier=rank_realloc_max_multiplier,
         )
 
     print("Start OSOP compression...")
@@ -875,6 +893,8 @@ if __name__ == "__main__":
         action="store_true",
         help="Use Energy-Guided OSOP rank reallocation under the same global parameter budget.",
     )
+    parser.add_argument("--rank_realloc_min_frac", type=float, default=0.7, help="Per-module rank floor as a fraction of the uniform base rank.")
+    parser.add_argument("--rank_realloc_max_multiplier", type=float, default=1.3, help="Per-module rank cap as a multiple of the uniform base rank.")
     parser.add_argument("--gamma_mode", type=str, default="ones", choices=["ones", "row_norm", "row_abs_mean"])
     parser.add_argument("--gamma_path", type=str, default=None, help="Optional torch file: {layer_idx: {linear_name: gamma_diag}}.")
     parser.add_argument("--damping", type=float, default=1e-6)
@@ -930,6 +950,8 @@ if __name__ == "__main__":
             accum_dtype=parse_accum_dtype(args.accum_dtype),
             osop_dim_threshold=args.osop_dim_threshold,
             rank_realloc=args.rank_realloc,
+            rank_realloc_min_frac=args.rank_realloc_min_frac,
+            rank_realloc_max_multiplier=args.rank_realloc_max_multiplier,
             propagate_compressed_outputs=args.propagate_compressed_outputs,
             local_update=args.local_update,
             teacher_update=args.teacher_update,
