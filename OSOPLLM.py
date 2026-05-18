@@ -1,7 +1,6 @@
 #coding:utf8
 import argparse
 import copy
-import heapq
 import os
 import sys
 from typing import Dict, Optional, Tuple
@@ -239,18 +238,6 @@ class OSOPAccumulator:
             self.gram += x.t().matmul(x).to("cpu", dtype=self.accum_dtype)
 
     @torch.no_grad()
-    def eigenvalues_desc(self) -> torch.Tensor:
-        if self.method != "osop":
-            raise RuntimeError("OSOP eigen spectrum is only defined for output-space accumulation.")
-        if self.nsamples == 0:
-            raise RuntimeError("No calibration samples were accumulated.")
-        gram = (self.gram.float() / float(self.nsamples)).contiguous()
-        gram = 0.5 * (gram + gram.t())
-        eigvals = torch.linalg.eigvalsh(gram)
-        eigvals = torch.clamp(eigvals, min=0)
-        return torch.flip(eigvals, dims=[0]).cpu()
-
-    @torch.no_grad()
     def factors(self) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.nsamples == 0:
             raise RuntimeError("No calibration samples were accumulated.")
@@ -338,16 +325,15 @@ def choose_method(weight: torch.Tensor, mode: str, osop_dim_threshold: float = 1
     raise ValueError(f"Unknown compression mode: {mode}")
 
 
-def build_svd_modules(model_name: str, model, layer, keep_ratio: float, layer_idx: int = 0, rank_config=None):
+def build_svd_modules(model_name: str, model, layer, keep_ratio: float, layer_idx: int = 0):
     if "llama" in model_name or "vicuna" in model_name:
-        svd_attn = SVD_LlamaAttention(config=model.config, ratio=keep_ratio, rank_config=rank_config)
+        svd_attn = SVD_LlamaAttention(config=model.config, ratio=keep_ratio)
         svd_attn.layer_idx = layer_idx
         svd_mlp = SVD_LlamaMLP(
             hidden_size=layer.hidden_size,
             intermediate_size=model.config.intermediate_size,
             hidden_act=model.config.hidden_act,
             ratio=keep_ratio,
-            rank_config=rank_config,
         )
         return svd_attn, svd_mlp, None
     if "mistral" in model_name:
@@ -416,145 +402,6 @@ def assign_factor(model_name: str, layer, svd_attn, svd_mlp, svd_decoder, name: 
         layer.mlp = svd_mlp
 
 
-def module_param_cost(weight: torch.Tensor) -> int:
-    return int(weight.shape[0] + weight.shape[1])
-
-
-def allocate_energy_guided_ranks(stats, min_rank_frac: float = 0.7, max_rank_multiplier: float = 1.3):
-    total_budget = 0
-    plan = {}
-    heap = []
-    used_budget = 0
-    stats_by_key = {stat["key"]: stat for stat in stats}
-
-    for stat in stats:
-        key = stat["key"]
-        cost = stat["cost"]
-        base_rank = stat["base_rank"]
-        min_rank = max(1, int(round(base_rank * min_rank_frac)))
-        max_rank = min(stat["max_rank"], max(min_rank, int(round(base_rank * max_rank_multiplier))))
-        eigvals = stat["eigvals"]
-        total_budget += base_rank * cost
-        rank = min(min_rank, max_rank)
-        plan[key] = rank
-        used_budget += rank * cost
-        if rank < max_rank and rank < eigvals.numel():
-            gain = float(eigvals[rank].item())
-            heapq.heappush(heap, (-(gain / cost), key, gain, cost))
-
-    while heap:
-        neg_gain_per_cost, key, gain, cost = heapq.heappop(heap)
-        if used_budget + cost > total_budget:
-            continue
-        stat = stats_by_key[key]
-        rank = plan[key]
-        max_rank = min(stat["max_rank"], max(1, int(round(stat["base_rank"] * max_rank_multiplier))))
-        if rank >= max_rank:
-            continue
-        used_budget += cost
-        rank += 1
-        plan[key] = rank
-        if rank < max_rank and rank < stat["eigvals"].numel():
-            next_gain = float(stat["eigvals"][rank].item())
-            heapq.heappush(heap, (-(next_gain / cost), key, next_gain, cost))
-
-    ranks = list(plan.values())
-    print(
-        "Rank reallocation summary: "
-        f"min={min(ranks)}, max={max(ranks)}, avg={sum(ranks) / len(ranks):.1f}, "
-        f"min_frac={min_rank_frac}, max_multiplier={max_rank_multiplier}"
-    )
-    return plan, total_budget, used_budget
-
-
-@torch.no_grad()
-def collect_osop_rank_stats(
-    model_name: str,
-    model,
-    layers,
-    inps: torch.Tensor,
-    attention_masks,
-    position_ids,
-    keep_ratio: float,
-    dev: str,
-    gamma_mode: str,
-    gamma_source,
-    damping: float,
-    accum_dtype: torch.dtype,
-    rank_realloc_min_frac: float,
-    rank_realloc_max_multiplier: float,
-):
-    print("Collecting OSOP spectra for energy-guided rank reallocation...")
-    stats = []
-    rank_inps = inps
-    for layer_idx in tqdm(range(len(layers))):
-        layer = layers[layer_idx].to(dev)
-        subset = find_layers(layer)
-        accumulators = {}
-
-        for name, module in subset.items():
-            base_rank = component_rank(model_name, model, name, module.weight, keep_ratio)
-            external_gamma = lookup_external_gamma(gamma_source, layer_idx, name)
-            gamma_diag = build_gamma_diag(
-                module.weight,
-                gamma_mode=gamma_mode,
-                damping=damping,
-                external_gamma=external_gamma,
-            )
-            accumulators[name] = OSOPAccumulator(
-                module,
-                rank=base_rank,
-                gamma_diag=gamma_diag,
-                method="osop",
-                damping=damping,
-                accum_dtype=accum_dtype,
-            )
-
-        handles = []
-        for name, module in subset.items():
-            def add_rank_stat_batch(module_, inp, out, layer_name=name):
-                del module_, out
-                accumulators[layer_name].add_batch(inp[0])
-            handles.append(module.register_forward_hook(add_rank_stat_batch))
-
-        outs = []
-        for sample_idx in range(rank_inps.shape[0]):
-            inp = rank_inps[sample_idx:sample_idx + 1].to(dev)
-            attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
-            pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
-            outs.append(run_decoder_layer(model_name, layer, inp, attn, pos).detach().cpu())
-
-        for handle in handles:
-            handle.remove()
-
-        for name, module in subset.items():
-            eigvals = accumulators[name].eigenvalues_desc()
-            base_rank = min(component_rank(model_name, model, name, module.weight, keep_ratio), module.weight.shape[0], module.weight.shape[1])
-            max_rank = min(module.weight.shape[0], module.weight.shape[1], eigvals.numel())
-            stats.append({
-                "key": (layer_idx, name),
-                "layer_idx": layer_idx,
-                "name": name,
-                "base_rank": base_rank,
-                "max_rank": max_rank,
-                "cost": module_param_cost(module.weight),
-                "eigvals": eigvals,
-            })
-
-        layers[layer_idx] = layer.cpu()
-        rank_inps = torch.cat(outs, dim=0)
-        del outs, accumulators, layer
-        torch.cuda.empty_cache()
-
-    plan, total_budget, used_budget = allocate_energy_guided_ranks(
-        stats,
-        min_rank_frac=rank_realloc_min_frac,
-        max_rank_multiplier=rank_realloc_max_multiplier,
-    )
-    print(f"Rank reallocation budget: base={total_budget}, allocated={used_budget}")
-    return plan
-
-
 @torch.no_grad()
 def run_decoder_layer(model_name: str, layer, inp, attention_mask, position_ids):
     if "opt" in model_name:
@@ -620,9 +467,7 @@ def osop_compress(
     damping: float = 1e-6,
     accum_dtype: torch.dtype = torch.float32,
     osop_dim_threshold: float = 1.0,
-    rank_realloc: bool = False,
-    rank_realloc_min_frac: float = 0.7,
-    rank_realloc_max_multiplier: float = 1.3,
+    error_feedback_beta: float = 0.0,
     propagate_compressed_outputs: bool = False,
     local_update: bool = False,
     teacher_update: bool = False,
@@ -636,29 +481,9 @@ def osop_compress(
     model.config.use_cache = False
     layers = get_transformer_layers(model_name, model)
     inps, attention_masks, position_ids = collect_first_layer_inputs(model_name, model, calib_loader, dev)
-    teacher_inps = inps if teacher_update else None
+    teacher_inps = inps if (teacher_update or error_feedback_beta > 0) else None
     teacher_target_patterns = parse_target_patterns(teacher_update_targets)
     dtype = next(iter(model.parameters())).dtype
-    rank_plan = {}
-    if rank_realloc:
-        if mode != "osop":
-            print("Warning: rank reallocation is designed for OSOP; non-OSOP fallback modules will still use reallocated ranks.")
-        rank_plan = collect_osop_rank_stats(
-            model_name=model_name,
-            model=model,
-            layers=layers,
-            inps=inps,
-            attention_masks=attention_masks,
-            position_ids=position_ids,
-            keep_ratio=keep_ratio,
-            dev=dev,
-            gamma_mode=gamma_mode,
-            gamma_source=gamma_source,
-            damping=damping,
-            accum_dtype=accum_dtype,
-            rank_realloc_min_frac=rank_realloc_min_frac,
-            rank_realloc_max_multiplier=rank_realloc_max_multiplier,
-        )
 
     print("Start OSOP compression...")
     for layer_idx in tqdm(range(len(layers))):
@@ -666,16 +491,14 @@ def osop_compress(
         subset = find_layers(layer)
         accumulators: Dict[str, OSOPAccumulator] = {}
         method_counts = {"osop": 0, "whitening": 0}
-        layer_rank_config = {}
+        profile_inps = inps
+        if error_feedback_beta > 0:
+            profile_inps = inps + error_feedback_beta * (teacher_inps - inps)
 
         for name, module in subset.items():
             method = choose_method(module.weight, mode, osop_dim_threshold=osop_dim_threshold)
             method_counts[method] += 1
-            rank = rank_plan.get(
-                (layer_idx, name),
-                component_rank(model_name, model, name, module.weight, keep_ratio),
-            )
-            layer_rank_config[name] = rank
+            rank = component_rank(model_name, model, name, module.weight, keep_ratio)
             external_gamma = lookup_external_gamma(gamma_source, layer_idx, name)
             gamma_diag = build_gamma_diag(
                 module.weight,
@@ -700,8 +523,8 @@ def osop_compress(
             handles.append(module.register_forward_hook(add_batch_hook))
 
         outs = []
-        for sample_idx in range(inps.shape[0]):
-            inp = inps[sample_idx:sample_idx + 1].to(dev)
+        for sample_idx in range(profile_inps.shape[0]):
+            inp = profile_inps[sample_idx:sample_idx + 1].to(dev)
             attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
             if "opt" in model_name:
                 out = layer(inp, attention_mask=attn)[0]
@@ -719,7 +542,6 @@ def osop_compress(
             layer,
             keep_ratio,
             layer_idx,
-            rank_config=layer_rank_config,
         )
         factors = {}
         for name, accumulator in accumulators.items():
@@ -743,8 +565,8 @@ def osop_compress(
                     refitters[layer_name].add_batch(inp[0], out)
                 refit_handles.append(module.register_forward_hook(add_refit_batch))
 
-            for sample_idx in range(inps.shape[0]):
-                inp = inps[sample_idx:sample_idx + 1].to(dev)
+            for sample_idx in range(profile_inps.shape[0]):
+                inp = profile_inps[sample_idx:sample_idx + 1].to(dev)
                 attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
                 pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
                 run_decoder_layer(model_name, layer, inp, attn, pos)
@@ -754,6 +576,17 @@ def osop_compress(
 
             for name, refitter in refitters.items():
                 factors[name][0] = refitter.solve_a()
+
+        if error_feedback_beta > 0 and not teacher_update:
+            teacher_outs = []
+            for sample_idx in range(teacher_inps.shape[0]):
+                teacher_inp = teacher_inps[sample_idx:sample_idx + 1].to(dev)
+                attn = None if attention_masks is None else attention_masks[sample_idx:sample_idx + 1].to(dev)
+                pos = None if position_ids is None else position_ids[sample_idx:sample_idx + 1].to(dev)
+                teacher_out = run_decoder_layer(model_name, layer, teacher_inp, attn, pos)
+                teacher_outs.append(teacher_out.detach().cpu())
+            teacher_inps = torch.cat(teacher_outs, dim=0)
+            del teacher_outs
 
         teacher_layer = copy.deepcopy(layer).to(dev) if teacher_update else None
 
@@ -836,7 +669,7 @@ def osop_compress(
             teacher_layer = teacher_layer.cpu()
             del teacher_outputs, teacher_outs, teacher_layer, compressed_layer, refitters
 
-        if local_update or teacher_update or propagate_compressed_outputs:
+        if local_update or teacher_update or propagate_compressed_outputs or error_feedback_beta > 0:
             compressed_layer = layers[layer_idx].to(dev)
             compressed_outs = []
             for sample_idx in range(inps.shape[0]):
@@ -889,12 +722,11 @@ if __name__ == "__main__":
         help="In hybrid mode, use OSOP only when d_out <= threshold * d_in. Try 0.75 to keep OSOP mainly for down_proj.",
     )
     parser.add_argument(
-        "--rank_realloc",
-        action="store_true",
-        help="Use Energy-Guided OSOP rank reallocation under the same global parameter budget.",
+        "--error_feedback_beta",
+        type=float,
+        default=0.0,
+        help="Use X_eff = X_compressed + beta * (H_teacher - H_compressed) for OSOP calibration. Try 0.1, 0.2, 0.5.",
     )
-    parser.add_argument("--rank_realloc_min_frac", type=float, default=0.7, help="Per-module rank floor as a fraction of the uniform base rank.")
-    parser.add_argument("--rank_realloc_max_multiplier", type=float, default=1.3, help="Per-module rank cap as a multiple of the uniform base rank.")
     parser.add_argument("--gamma_mode", type=str, default="ones", choices=["ones", "row_norm", "row_abs_mean"])
     parser.add_argument("--gamma_path", type=str, default=None, help="Optional torch file: {layer_idx: {linear_name: gamma_diag}}.")
     parser.add_argument("--damping", type=float, default=1e-6)
@@ -949,9 +781,7 @@ if __name__ == "__main__":
             damping=args.damping,
             accum_dtype=parse_accum_dtype(args.accum_dtype),
             osop_dim_threshold=args.osop_dim_threshold,
-            rank_realloc=args.rank_realloc,
-            rank_realloc_min_frac=args.rank_realloc_min_frac,
-            rank_realloc_max_multiplier=args.rank_realloc_max_multiplier,
+            error_feedback_beta=args.error_feedback_beta,
             propagate_compressed_outputs=args.propagate_compressed_outputs,
             local_update=args.local_update,
             teacher_update=args.teacher_update,
@@ -964,8 +794,8 @@ if __name__ == "__main__":
         if args.save_path is not None:
             os.makedirs(args.save_path, exist_ok=True)
             extra_tags = []
-            if args.rank_realloc:
-                extra_tags.append("rankrealloc")
+            if args.error_feedback_beta > 0:
+                extra_tags.append(f"errfb{args.error_feedback_beta:g}")
             if args.propagate_compressed_outputs:
                 extra_tags.append("prop")
             if args.local_update:
