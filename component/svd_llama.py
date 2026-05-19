@@ -23,17 +23,6 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
 
-
-def rank_from_config(rank_config, name, default):
-    if rank_config is None:
-        return default
-    if name in rank_config:
-        return rank_config[name]
-    for key, value in rank_config.items():
-        if key.endswith(name):
-            return value
-    return default
-
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -148,22 +137,18 @@ class SVD_LlamaMLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         ratio=1,
-        rank_config=None,
     ):
         super().__init__()
         self.ratio = ratio
         low_rank = int(intermediate_size * hidden_size * self.ratio / (intermediate_size + hidden_size))
-        gate_rank = rank_from_config(rank_config, "gate_proj", low_rank)
-        down_rank = rank_from_config(rank_config, "down_proj", low_rank)
-        up_rank = rank_from_config(rank_config, "up_proj", low_rank)
-        self.gate_u_proj = nn.Linear(gate_rank, intermediate_size, bias=False)
-        self.gate_v_proj = nn.Linear(hidden_size, gate_rank, bias=False)
+        self.gate_u_proj = nn.Linear(low_rank, intermediate_size, bias=False)
+        self.gate_v_proj = nn.Linear(hidden_size, low_rank, bias=False)
         
-        self.down_u_proj = nn.Linear(down_rank, hidden_size, bias=False)
-        self.down_v_proj = nn.Linear(intermediate_size, down_rank, bias=False)
+        self.down_u_proj = nn.Linear(low_rank, hidden_size, bias=False)
+        self.down_v_proj = nn.Linear(intermediate_size, low_rank, bias=False)
         
-        self.up_u_proj = nn.Linear(up_rank, intermediate_size, bias=False)
-        self.up_v_proj = nn.Linear(hidden_size, up_rank, bias=False)
+        self.up_u_proj = nn.Linear(low_rank, intermediate_size, bias=False)
+        self.up_v_proj = nn.Linear(hidden_size, low_rank, bias=False)
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
@@ -180,7 +165,7 @@ class SVD_LlamaAttention(nn.Module):
     factorized projections.
     """
 
-    def __init__(self, config: LlamaConfig, ratio=1, rank_config=None):
+    def __init__(self, config: LlamaConfig, ratio=1):
         super().__init__()
         self.config = config
         self.layer_idx = None
@@ -200,21 +185,17 @@ class SVD_LlamaAttention(nn.Module):
                 f" and `num_heads`: {self.num_heads})."
             )
         low_rank = int(self.hidden_size * self.ratio/2)
-        q_rank = rank_from_config(rank_config, "q_proj", low_rank)
-        k_rank = rank_from_config(rank_config, "k_proj", low_rank)
-        v_rank = rank_from_config(rank_config, "v_proj", low_rank)
-        o_rank = rank_from_config(rank_config, "o_proj", low_rank)
-        self.q_u_proj = nn.Linear(q_rank, self.num_heads * self.head_dim, bias=False)
-        self.q_v_proj = nn.Linear(self.hidden_size, q_rank, bias=False)
+        self.q_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=False)
+        self.q_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
 
-        self.k_u_proj = nn.Linear(k_rank, self.num_key_value_heads * self.head_dim, bias=False)
-        self.k_v_proj = nn.Linear(self.hidden_size, k_rank, bias=False)
+        self.k_u_proj = nn.Linear(low_rank, self.num_key_value_heads * self.head_dim, bias=False)
+        self.k_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
 
-        self.v_u_proj = nn.Linear(v_rank, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_v_proj = nn.Linear(self.hidden_size, v_rank, bias=False)
+        self.v_u_proj = nn.Linear(low_rank, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
 
-        self.o_u_proj = nn.Linear(o_rank, self.hidden_size, bias=False)
-        self.o_v_proj = nn.Linear(self.num_heads * self.head_dim, o_rank, bias=False)
+        self.o_u_proj = nn.Linear(low_rank, self.hidden_size, bias=False)
+        self.o_v_proj = nn.Linear(self.num_heads * self.head_dim, low_rank, bias=False)
 
         if OfficialLlamaRotaryEmbedding is not None:
             try:
