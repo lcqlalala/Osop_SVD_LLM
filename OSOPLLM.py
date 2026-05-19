@@ -325,10 +325,12 @@ class LowRankRefitAccumulator:
         hth = self.hth.float() / float(self.nsamples)
         hty = self.hty.float() / float(self.nsamples)
         eye = torch.eye(self.rank, dtype=hth.dtype)
+        diag_scale = torch.trace(hth).abs() / max(1, self.rank)
+        damp = self.damping * torch.clamp(diag_scale, min=1e-12)
         try:
-            a_t = torch.linalg.solve(hth + self.damping * eye, hty)
+            a_t = torch.linalg.solve(hth + damp * eye, hty)
         except RuntimeError:
-            a_t = torch.linalg.lstsq(hth + self.damping * eye, hty).solution
+            a_t = torch.linalg.lstsq(hth + damp * eye, hty).solution
         return a_t.t().contiguous()
 
 
