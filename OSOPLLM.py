@@ -65,14 +65,31 @@ def target_rank(weight: torch.Tensor, keep_ratio: float) -> int:
     return max(1, rank)
 
 
-def component_rank(model_name: str, model, name: str, weight: torch.Tensor, keep_ratio: float) -> int:
+def component_rank(
+    model_name: str,
+    model,
+    name: str,
+    weight: torch.Tensor,
+    keep_ratio: float,
+    layer_idx: int = -1,
+    num_layers: int = 32,
+    nonuniform_ranks: bool = False,
+) -> int:
+    actual_ratio = keep_ratio
+    if nonuniform_ranks:
+        if layer_idx != -1 and (layer_idx < 2 or layer_idx >= num_layers - 2):
+            actual_ratio = max(keep_ratio, 0.8)
+        elif "down_proj" in name:
+            actual_ratio = min(keep_ratio * 1.2, 0.8)
+        elif any(proj in name for proj in ("q_proj", "k_proj", "v_proj", "up_proj", "gate_proj")):
+            actual_ratio = max(keep_ratio * 0.9, 0.1)
     if ("llama" in model_name or "vicuna" in model_name) and any(
         proj in name for proj in ("q_proj", "k_proj", "v_proj", "o_proj")
     ):
-        return max(1, int(model.config.hidden_size * keep_ratio / 2))
+        return max(1, int(model.config.hidden_size * actual_ratio / 2))
     if "mistral" in model_name and any(proj in name for proj in ("q_proj", "k_proj", "v_proj", "o_proj")):
-        return max(1, int(model.config.hidden_size * keep_ratio / 2))
-    return target_rank(weight, keep_ratio)
+        return max(1, int(model.config.hidden_size * actual_ratio / 2))
+    return target_rank(weight, actual_ratio)
 
 
 def pad_factors(a: torch.Tensor, b: torch.Tensor, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -255,7 +272,13 @@ class OSOPAccumulator:
             if self.weight_prior_lambda > 0:
                 weighted = self.gamma_sqrt.float().unsqueeze(1) * weight
                 prior = weighted.matmul(weighted.t()) / float(weight.shape[1])
-                gram = gram + self.weight_prior_lambda * prior
+                trace_data = torch.trace(gram)
+                trace_prior = torch.trace(prior)
+                if trace_prior > 1e-12:
+                    scale = (trace_data / trace_prior).item()
+                else:
+                    scale = 1.0
+                gram = gram + (self.weight_prior_lambda * scale) * prior
             _, eigvecs = torch.linalg.eigh(gram)
             u_k = eigvecs[:, -rank:].contiguous()
             a = inv_gamma_sqrt.unsqueeze(1) * u_k
@@ -310,8 +333,8 @@ class LowRankRefitAccumulator:
     def solve_a(self) -> torch.Tensor:
         if self.nsamples == 0:
             raise RuntimeError("No calibration samples were accumulated for local refit.")
-        hth = self.hth.float()
-        hty = self.hty.float()
+        hth = self.hth.float() / float(self.nsamples)
+        hty = self.hty.float() / float(self.nsamples)
         eye = torch.eye(self.rank, dtype=hth.dtype)
         try:
             a_t = torch.linalg.solve(hth + self.damping * eye, hty)
@@ -331,15 +354,16 @@ def choose_method(weight: torch.Tensor, mode: str, osop_dim_threshold: float = 1
     raise ValueError(f"Unknown compression mode: {mode}")
 
 
-def build_svd_modules(model_name: str, model, layer, keep_ratio: float, layer_idx: int = 0):
+def build_svd_modules(model_name: str, model, layer, keep_ratio: float, layer_idx: int = 0, rank_config=None):
     if "llama" in model_name or "vicuna" in model_name:
-        svd_attn = SVD_LlamaAttention(config=model.config, ratio=keep_ratio)
+        svd_attn = SVD_LlamaAttention(config=model.config, ratio=keep_ratio, rank_config=rank_config)
         svd_attn.layer_idx = layer_idx
         svd_mlp = SVD_LlamaMLP(
             hidden_size=layer.hidden_size,
             intermediate_size=model.config.intermediate_size,
             hidden_act=model.config.hidden_act,
             ratio=keep_ratio,
+            rank_config=rank_config,
         )
         return svd_attn, svd_mlp, None
     if "mistral" in model_name:
@@ -474,6 +498,7 @@ def osop_compress(
     accum_dtype: torch.dtype = torch.float32,
     osop_dim_threshold: float = 1.0,
     osop_weight_prior_lambda: float = 0.0,
+    nonuniform_ranks: bool = False,
     error_feedback_beta: float = 0.0,
     propagate_compressed_outputs: bool = False,
     local_update: bool = False,
@@ -498,6 +523,7 @@ def osop_compress(
         subset = find_layers(layer)
         accumulators: Dict[str, OSOPAccumulator] = {}
         method_counts = {"osop": 0, "whitening": 0}
+        layer_rank_config = {}
         profile_inps = inps
         if error_feedback_beta > 0:
             profile_inps = inps + error_feedback_beta * (teacher_inps - inps)
@@ -505,7 +531,17 @@ def osop_compress(
         for name, module in subset.items():
             method = choose_method(module.weight, mode, osop_dim_threshold=osop_dim_threshold)
             method_counts[method] += 1
-            rank = component_rank(model_name, model, name, module.weight, keep_ratio)
+            rank = component_rank(
+                model_name,
+                model,
+                name,
+                module.weight,
+                keep_ratio,
+                layer_idx=layer_idx,
+                num_layers=len(layers),
+                nonuniform_ranks=nonuniform_ranks,
+            )
+            layer_rank_config[name] = rank
             external_gamma = lookup_external_gamma(gamma_source, layer_idx, name)
             gamma_diag = build_gamma_diag(
                 module.weight,
@@ -550,6 +586,7 @@ def osop_compress(
             layer,
             keep_ratio,
             layer_idx,
+            rank_config=layer_rank_config,
         )
         factors = {}
         for name, accumulator in accumulators.items():
@@ -746,6 +783,11 @@ if __name__ == "__main__":
         help="Add lambda * (Gamma^0.5 W)(Gamma^0.5 W)^T / d_in to OSOP output Gram for a weight-structure prior.",
     )
     parser.add_argument(
+        "--nonuniform_ranks",
+        action="store_true",
+        help="Use heuristic non-uniform ranks: protect first/last layers and down_proj, slightly reduce q/k/v/up/gate.",
+    )
+    parser.add_argument(
         "--propagate_compressed_outputs",
         action="store_true",
         help="After each layer is compressed, feed its compressed outputs to calibrate later layers.",
@@ -796,6 +838,7 @@ if __name__ == "__main__":
             accum_dtype=parse_accum_dtype(args.accum_dtype),
             osop_dim_threshold=args.osop_dim_threshold,
             osop_weight_prior_lambda=args.osop_weight_prior_lambda,
+            nonuniform_ranks=args.nonuniform_ranks,
             error_feedback_beta=args.error_feedback_beta,
             propagate_compressed_outputs=args.propagate_compressed_outputs,
             local_update=args.local_update,
@@ -811,6 +854,8 @@ if __name__ == "__main__":
             extra_tags = []
             if args.osop_weight_prior_lambda > 0:
                 extra_tags.append(f"wprior{args.osop_weight_prior_lambda:g}")
+            if args.nonuniform_ranks:
+                extra_tags.append("nonuniform")
             if args.error_feedback_beta > 0:
                 extra_tags.append(f"errfb{args.error_feedback_beta:g}")
             if args.propagate_compressed_outputs:
