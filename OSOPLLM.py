@@ -206,6 +206,7 @@ class OSOPAccumulator:
         method: str,
         damping: float,
         accum_dtype: torch.dtype = torch.float32,
+        weight_prior_lambda: float = 0.0,
     ):
         self.layer = layer
         self.rank = rank
@@ -214,6 +215,7 @@ class OSOPAccumulator:
         self.method = method
         self.damping = damping
         self.accum_dtype = accum_dtype
+        self.weight_prior_lambda = weight_prior_lambda
         self.nsamples = 0
 
         rows, columns = layer.weight.shape
@@ -250,6 +252,10 @@ class OSOPAccumulator:
         if self.method == "osop":
             gram = (self.gram.float() / float(self.nsamples)).contiguous()
             gram = 0.5 * (gram + gram.t())
+            if self.weight_prior_lambda > 0:
+                weighted = self.gamma_sqrt.float().unsqueeze(1) * weight
+                prior = weighted.matmul(weighted.t()) / float(weight.shape[1])
+                gram = gram + self.weight_prior_lambda * prior
             _, eigvecs = torch.linalg.eigh(gram)
             u_k = eigvecs[:, -rank:].contiguous()
             a = inv_gamma_sqrt.unsqueeze(1) * u_k
@@ -467,6 +473,7 @@ def osop_compress(
     damping: float = 1e-6,
     accum_dtype: torch.dtype = torch.float32,
     osop_dim_threshold: float = 1.0,
+    osop_weight_prior_lambda: float = 0.0,
     error_feedback_beta: float = 0.0,
     propagate_compressed_outputs: bool = False,
     local_update: bool = False,
@@ -513,6 +520,7 @@ def osop_compress(
                 method=method,
                 damping=damping,
                 accum_dtype=accum_dtype,
+                weight_prior_lambda=osop_weight_prior_lambda,
             )
 
         handles = []
@@ -732,6 +740,12 @@ if __name__ == "__main__":
     parser.add_argument("--damping", type=float, default=1e-6)
     parser.add_argument("--accum_dtype", type=str, default="float32", choices=["float32", "float64"])
     parser.add_argument(
+        "--osop_weight_prior_lambda",
+        type=float,
+        default=0.0,
+        help="Add lambda * (Gamma^0.5 W)(Gamma^0.5 W)^T / d_in to OSOP output Gram for a weight-structure prior.",
+    )
+    parser.add_argument(
         "--propagate_compressed_outputs",
         action="store_true",
         help="After each layer is compressed, feed its compressed outputs to calibrate later layers.",
@@ -781,6 +795,7 @@ if __name__ == "__main__":
             damping=args.damping,
             accum_dtype=parse_accum_dtype(args.accum_dtype),
             osop_dim_threshold=args.osop_dim_threshold,
+            osop_weight_prior_lambda=args.osop_weight_prior_lambda,
             error_feedback_beta=args.error_feedback_beta,
             propagate_compressed_outputs=args.propagate_compressed_outputs,
             local_update=args.local_update,
@@ -794,6 +809,8 @@ if __name__ == "__main__":
         if args.save_path is not None:
             os.makedirs(args.save_path, exist_ok=True)
             extra_tags = []
+            if args.osop_weight_prior_lambda > 0:
+                extra_tags.append(f"wprior{args.osop_weight_prior_lambda:g}")
             if args.error_feedback_beta > 0:
                 extra_tags.append(f"errfb{args.error_feedback_beta:g}")
             if args.propagate_compressed_outputs:
