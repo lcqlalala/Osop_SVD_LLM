@@ -99,6 +99,26 @@ def flatten_activations(inp: torch.Tensor) -> torch.Tensor:
     return inp.reshape(-1, inp.shape[-1])
 
 
+def apply_error_feedback(
+    compressed: torch.Tensor,
+    teacher: torch.Tensor,
+    beta: float,
+    clip_ratio: float = 0.0,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    delta = beta * (teacher - compressed)
+    if clip_ratio <= 0:
+        return compressed + delta
+
+    delta_flat = delta.reshape(delta.shape[0], -1)
+    compressed_flat = compressed.reshape(compressed.shape[0], -1)
+    delta_norm = torch.linalg.norm(delta_flat.float(), dim=1).clamp_min(eps)
+    compressed_norm = torch.linalg.norm(compressed_flat.float(), dim=1)
+    scale = (clip_ratio * compressed_norm / delta_norm).clamp(max=1.0)
+    view_shape = (delta.shape[0],) + (1,) * (delta.dim() - 1)
+    return compressed + delta * scale.to(delta.device, dtype=delta.dtype).view(view_shape)
+
+
 def cat_optional_tensors(tensors):
     if all(tensor is None for tensor in tensors):
         return None
@@ -489,6 +509,7 @@ def osop_compress(
     osop_dim_threshold: float = 1.0,
     osop_weight_prior_lambda: float = 0.0,
     error_feedback_beta: float = 0.0,
+    error_feedback_clip_ratio: float = 0.0,
     propagate_compressed_outputs: bool = False,
     local_update: bool = False,
     teacher_update: bool = False,
@@ -514,7 +535,12 @@ def osop_compress(
         method_counts = {"osop": 0, "whitening": 0}
         profile_inps = inps
         if error_feedback_beta > 0:
-            profile_inps = inps + error_feedback_beta * (teacher_inps - inps)
+            profile_inps = apply_error_feedback(
+                compressed=inps,
+                teacher=teacher_inps,
+                beta=error_feedback_beta,
+                clip_ratio=error_feedback_clip_ratio,
+            )
 
         for name, module in subset.items():
             method = choose_method(module.weight, mode, osop_dim_threshold=osop_dim_threshold)
@@ -749,6 +775,12 @@ if __name__ == "__main__":
         default=0.0,
         help="Use X_eff = X_compressed + beta * (H_teacher - H_compressed) for OSOP calibration. Try 0.1, 0.2, 0.5.",
     )
+    parser.add_argument(
+        "--error_feedback_clip_ratio",
+        type=float,
+        default=0.0,
+        help="If >0, clip ||beta * error|| per calibration sample to this fraction of ||H_compressed||. Try 0.05, 0.10, 0.15, 0.20.",
+    )
     parser.add_argument("--gamma_mode", type=str, default="ones", choices=["ones", "row_norm", "row_abs_mean"])
     parser.add_argument("--gamma_path", type=str, default=None, help="Optional torch file: {layer_idx: {linear_name: gamma_diag}}.")
     parser.add_argument("--damping", type=float, default=1e-6)
@@ -811,6 +843,7 @@ if __name__ == "__main__":
             osop_dim_threshold=args.osop_dim_threshold,
             osop_weight_prior_lambda=args.osop_weight_prior_lambda,
             error_feedback_beta=args.error_feedback_beta,
+            error_feedback_clip_ratio=args.error_feedback_clip_ratio,
             propagate_compressed_outputs=args.propagate_compressed_outputs,
             local_update=args.local_update,
             teacher_update=args.teacher_update,
@@ -827,6 +860,8 @@ if __name__ == "__main__":
                 extra_tags.append(f"wprior{args.osop_weight_prior_lambda:g}")
             if args.error_feedback_beta > 0:
                 extra_tags.append(f"errfb{args.error_feedback_beta:g}")
+            if args.error_feedback_clip_ratio > 0:
+                extra_tags.append(f"efclip{args.error_feedback_clip_ratio:g}")
             if args.propagate_compressed_outputs:
                 extra_tags.append("prop")
             if args.local_update:
